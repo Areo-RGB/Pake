@@ -1,0 +1,148 @@
+name: Android feature bootstrap
+
+on:
+  push:
+    branches:
+      - automation/android-webapps-bootstrap
+
+permissions:
+  contents: write
+
+jobs:
+  validate-and-materialize:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Apply Android feature patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          base64 -d .github/android-feature.patch.gz.b64 | gzip -dc > /tmp/android-feature.patch
+          git apply --check /tmp/android-feature.patch
+          git apply /tmp/android-feature.patch
+          python - <<'PY'
+          from pathlib import Path
+          path = Path('bin/builders/AndroidBuilder.ts')
+          text = path.read_text()
+          old = """    if (this.options.icon && (await fsExtra.pathExists(this.options.icon))) {
+                logger.info('✸ Generating Android app icons...');
+                await shellExec(
+                  tauriCommand(packageManager, ['icon', this.options.icon]),
+                  timeout,
+                  buildEnv,
+                );
+              }
+          """
+          new = """    if (this.options.icon && (await fsExtra.pathExists(this.options.icon))) {
+                logger.info('✸ Generating Android app icons...');
+                const iconsDir = path.join(npmDirectory, 'src-tauri', 'icons');
+                const backupDir = path.join(
+                  npmDirectory,
+                  'src-tauri',
+                  '.pake',
+                  'android-icons-backup',
+                );
+                const hadIcons = await fsExtra.pathExists(iconsDir);
+                await fsExtra.remove(backupDir);
+                if (hadIcons) await fsExtra.copy(iconsDir, backupDir);
+          
+                try {
+                  await shellExec(
+                    tauriCommand(packageManager, ['icon', this.options.icon]),
+                    timeout,
+                    buildEnv,
+                  );
+                } finally {
+                  // `tauri icon` writes Android resources into `gen/android` but also
+                  // refreshes the desktop icon set. Keep Android's generated resources
+                  // while leaving Pake's reusable desktop template untouched.
+                  if (hadIcons) {
+                    await fsExtra.emptyDir(iconsDir);
+                    await fsExtra.copy(backupDir, iconsDir);
+                  } else {
+                    await fsExtra.remove(iconsDir);
+                  }
+                  await fsExtra.remove(backupDir);
+                }
+              }
+          """
+          if old not in text:
+              raise SystemExit('Android icon generation block not found')
+          path.write_text(text.replace(old, new))
+          PY
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.26.2
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Install dependencies and refresh locks
+        shell: bash
+        run: |
+          set -euo pipefail
+          pnpm install --no-frozen-lockfile
+          cargo update --manifest-path src-tauri/Cargo.toml -p tauri --precise 2.11.1
+          cargo update --manifest-path src-tauri/Cargo.toml -p tauri-build --precise 2.6.1
+
+      - name: Format and build CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --name-only --diff-filter=ACM HEAD | xargs -r pnpm exec prettier --write --ignore-unknown
+          cargo fmt --manifest-path src-tauri/Cargo.toml --all
+          pnpm run cli:build
+
+      - name: Run unit tests
+        run: pnpm exec vitest run
+
+      - name: Install Android SDK and NDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager 'platform-tools' 'platforms;android-36' 'ndk;29.0.13846066'
+          echo "NDK_HOME=$ANDROID_HOME/ndk/29.0.13846066" >> "$GITHUB_ENV"
+
+      - name: Smoke-build Android APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          node dist/cli.js https://example.com \
+            --name AndroidSmoke \
+            --platform android \
+            --android-format apk \
+            --icon src-tauri/png/icon_512.png \
+            --debug \
+            --json > /tmp/android-smoke.json
+          cat /tmp/android-smoke.json
+          test -f AndroidSmoke_1.0.0_android.apk
+          rm -f AndroidSmoke_1.0.0_android.apk
+
+      - name: Commit validated feature
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f .github/android-feature.patch.gz.b64 .github/workflows/android-feature-bootstrap.yml
+          git add -A
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m 'feat: add Android webpage packaging'
+          git push origin HEAD:automation/android-webapps-bootstrap
