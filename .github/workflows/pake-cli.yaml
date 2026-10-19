@@ -95,6 +95,10 @@ jobs:
         if: runner.os == 'Linux'
         uses: rui314/setup-mold@v1
 
+      - name: Install bsdtar for zst packaging
+        if: runner.os == 'Linux'
+        run: sudo apt-get install -y libarchive-tools
+
       - name: Build App (Linux/macOS)
         if: runner.os != 'Windows'
         timeout-minutes: 25
